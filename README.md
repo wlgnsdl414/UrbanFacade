@@ -18,7 +18,7 @@
 The core script is ['main.py'](main.py), which:
 
 1. Loads the **COCO benchmark** and **UrbanFacade** segmentation model.
-2. For each image in the 'input/' folder:
+2. For each image in the 'input' folder:
    - Runs both models and creates **benchmark**, **façade**, and **combined** segmentation maps.
    - Computes **Transparency, Harmony, and Complexity** indices from the combined segmentation.
    - (Optionally) computes **PlacePulse-based perceptual scores** (Beautiful, Boring, Depressing, Lively, Safe, Wealthy).
@@ -28,20 +28,17 @@ The core script is ['main.py'](main.py), which:
 
 ## Examples
 
-### Original image
-![Original Image](examples/Original_image.jpg)
+| Original image | Ground truth |
+|---------|--------------|
+| ![](examples/Original_image.jpg) | ![](examples/Ground_truth.png) |
 
-### Ground truth
-![Ground truth](examples/Ground_truth.png)
+| Benchmark model | Facade model |
+|-----------|--------|
+| ![](examples/Benchmark_model.png) | ![](examples/Facade_model.png) |
 
-### Benchmark model
-![Benchmark model](examples/Benchmark_model.png)
-
-### Facade model
-![Facade model](examples/Facade_model.png)
-
-### Combined output (UrbanFacade model)
-![Combined output](examples/Combined_output.png)
+| Combined output (UrbanFacade model) |
+|-----------------|
+| ![](examples/Combined_output.png) |
 
 ---
 
@@ -49,9 +46,9 @@ The core script is ['main.py'](main.py), which:
 
 * **COCO benchmark model**: This repository does *not* include the TensorFlow-based COCO segmentation model ('resnet50_kmax_deeplab_coco_train') due to size and redistribution constraints. Users must manually download the model from [this link](https://storage.googleapis.com/gresearch/tf-deeplab/saved_model/resnet50_kmax_deeplab_coco_train.tar.gz) and place the extracted folder into the 'model' directory.
 
-* **UrbanFacade model**: The file 'UrbanFacade.pth' is stored via Git LFS. Likewise, download the model from [this link] and place the model file into the 'model' directory.
+* **UrbanFacade model**: The file 'UrbanFacade.pth' is *already* stored in the 'model' directory via Git LFS.
 
-* **PlacePulse model**: Public release of this repository does not redistribute the PlacePulse model weights due to dataset and licensing considerations. The PlacePulse-based perceptual scores are therefore disabled by default in this code.
+* **PlacePulse model**: Public release of this repository does not redistribute the PlacePulse model weights due to dataset and licensing considerations. The PlacePulse-based perceptual scores are therefore *disabled* by default in this code.
 
 ---
 
@@ -86,3 +83,4 @@ The core script is ['main.py'](main.py), which:
 
 * This repository accompanies the manuscript authored by **Jihun Oh** (first author) and **Jaewoong Won** (corresponding author).  
 * The development of this code was supported by the Smart Urban & Real Estate Lab. at Kyung Hee University.
+* If you use this code, please cite our paper once it becomes available.
