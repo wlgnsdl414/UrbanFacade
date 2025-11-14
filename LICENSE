@@ -1,0 +1,27 @@
+UrbanFacade: Façade-based Streetscape Indices from Street-Level Images
+Copyright (c) 2025 [Jihun Oh]
+
+This repository contains source code and models accompanying the manuscript:
+"From façade to urban vitality: Quantifying streetscape quality through façade object detection"
+
+LICENSE: Creative Commons Attribution-NonCommercial 4.0 (CC BY-NC 4.0)
+
+You are free to:
+  • Use the code and models for academic research, education, and replication.
+  • Modify and adapt the code with proper attribution.
+  • Cite the original paper in any derivative works.
+
+You may NOT:
+  • Use the code, models, or outputs for commercial purposes.
+  • Redistribute the dataset (raw images or annotations) included in the study,
+    as it contains privacy-sensitive or location-identifiable content.
+
+Attribution Requirement:
+  When using or modifying the code, please cite the following paper:
+
+  [Full citation of your manuscript once published]
+
+For dataset access:
+  The dataset used in this study cannot be publicly released due to privacy
+  and licensing restrictions but may be shared upon reasonable request
+  for academic research purposes.

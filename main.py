@@ -1,0 +1,507 @@
+"""
+Prediction script for the UrbanFacade model
+  - Loads Facade model and benchmark model (COCO), then combines their predictions
+  - Computes Transparency, Harmony, Complexity indices
+  - Evaluates PlacePulse-based perceptual scores (optional)
+"""
+# -------------------------------------------------------------------------
+# Setting
+# -------------------------------------------------------------------------
+# Import libraries
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import json
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50
+from torchvision import models, transforms
+
+import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+from skimage.metrics import structural_similarity as ssim
+from skimage import transform
+from PIL import Image
+
+import logging, warnings
+logging.getLogger("absl").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {device}")
+torch.backends.cudnn.benchmark = (device.type == "cuda")
+
+# Paths
+def resolve_base_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
+
+    spyder_file = os.environ.get('SPYDER_FILE')
+    if spyder_file and Path(spyder_file).exists():
+        return Path(spyder_file).resolve().parent
+
+    return Path.cwd()
+
+base_dir = resolve_base_dir()
+model_dir = base_dir / "model"
+input_dir = base_dir / "input"
+output_dir = base_dir / "output"
+
+for p in (model_dir, input_dir, output_dir):
+    if not p.exists():
+        raise FileNotFoundError(f"Required folder not found: {p} (BASE_DIR={base_dir})")
+
+
+# Image list
+def load_image_list(input_dir):
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    image_list = []
+
+    for root, _, files in os.walk(input_dir):
+        for f in files:
+            if f.lower().endswith(exts):
+                rel_path = os.path.relpath(os.path.join(root, f), input_dir)
+                image_list.append(rel_path)
+
+    print(f"Total images found: {len(image_list)}")
+    return image_list
+
+# Random seed
+def set_seed(seed=10):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+set_seed(10)
+
+# Classes & Color palette for Facade model
+num_classes = 10
+
+facade_classes = {
+    0: "Background",
+    1: "Door",
+    2: "Signboard_Channel",
+    3: "Signboard_Front",
+    4: "Signboard_Side",
+    5: "Signboard_Stand",
+    6: "Window_Full_Trp",
+    7: "Window_Non_Trp",
+    8: "Window_Semi_Trp",
+    9: "Building"
+}
+
+facade_colors = np.array([
+    (0, 0, 0),        # background
+    (0, 0, 255),      # door
+    (0, 255, 0),      # signboard_channel
+    (255, 0, 0),      # signboard_front
+    (0, 255, 255),    # signboard_side
+    (255, 0, 255),    # signboard_stand
+    (255, 255, 0),    # window_full_trp
+    (128, 0, 128),    # window_non_trp
+    (0, 165, 255),    # window_semi_trp
+    (128, 128, 128)   # building
+], dtype=np.uint8)
+
+def colorize(mask: np.ndarray) -> np.ndarray:
+    return facade_colors[mask.clip(0, len(facade_colors)-1)]
+
+# Classes & Color palette for COCO model
+model_name = "resnet50_kmax_deeplab_coco_train"
+loaded_model = tf.saved_model.load(os.path.join(model_dir, model_name))
+infer = loaded_model.signatures['serving_default']
+
+with open(os.path.join(model_dir, "coco_meta.json"), "r", encoding="utf-8") as f:
+    COCO_META = json.load(f)
+for i in range(len(COCO_META)):
+    COCO_META[i]["id"] = i + 1
+id2label = {c["id"]: c["name"] for c in COCO_META}
+
+def _coco_label_colormap():
+    colormap = np.zeros((256, 3), dtype=np.uint8)
+    for category in COCO_META:
+        colormap[category['id']] = category['color']
+    return colormap
+coco_colormap = _coco_label_colormap()
+
+def colorize_coco(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    colored = np.zeros((h, w, 3), dtype=np.uint8)
+    for label in np.unique(mask):
+        if label < len(coco_colormap):
+            colored[mask == label] = coco_colormap[label]
+    return colored
+
+# -------------------------------------------------------------------------
+# Facade model architecture
+# -------------------------------------------------------------------------
+class Decoder(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, 2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_ch+skip_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim = 1)
+        return self.conv(x)
+
+class FacadeResNet(nn.Module):
+    def __init__(self, n_classes=num_classes):
+        super().__init__()
+        base = resnet50(weights=None)
+        self.layer0 = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+        self.layer1, self.layer2, self.layer3, self.layer4 = base.layer1, base.layer2, base.layer3, base.layer4
+        self.up3 = Decoder(2048, 1024, 512)
+        self.up2 = Decoder(512, 512, 256)
+        self.up1 = Decoder(256, 256, 128)
+        self.final = nn.Conv2d(128, n_classes, 1)
+    def forward(self, x):
+        s0 = self.layer0(x)
+        s1 = self.layer1(s0)
+        s2 = self.layer2(s1)
+        s3 = self.layer3(s2)
+        s4 = self.layer4(s3)
+        d3 = self.up3(s4, s3)
+        d2 = self.up2(d3, s2)
+        d1 = self.up1(d2, s1)
+        out = self.final(d1)
+        return F.interpolate(out, size=x.shape[2:], mode="bilinear", align_corners=False)
+
+# -------------------------------------------------------------------------
+# Compute harmony index
+# -------------------------------------------------------------------------
+def compute_harmony(orig_image, mask, n_frames=5):
+    H, W = mask.shape[:2]
+
+    # ===============================
+    # Rectification
+    # ===============================
+    if mask.ndim == 3:
+        mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    else:
+        mask_gray = mask.copy().astype(np.uint8)
+
+    src_pts = np.array([
+        [0, H],          # bottom-left
+        [W, H],          # bottom-right
+        [W*0.8, 0],      # top-right (approximate)
+        [W*0.2, 0]       # top-left (approximate)
+    ])
+
+    dst_pts = np.array([
+        [0, H],          # bottom-left
+        [W, H],          # bottom-right
+        [W, 0],          # top-right
+        [0, 0]           # top-left
+    ])
+
+    tform = transform.ProjectiveTransform()
+    success = tform.estimate(src_pts, dst_pts)
+    if success:
+        rectified = transform.warp(mask_gray, tform, output_shape=(H, W), preserve_range=True)
+        rectified = rectified.astype(np.uint8)
+    else:
+        rectified = mask_gray.copy()
+
+    # ===============================
+    # Frame split
+    # ===============================
+    frame_width = max(1, W // n_frames)
+    frames = [rectified[:, i*frame_width:(i+1)*frame_width] for i in range(n_frames)]
+
+    # ===============================
+    # Similarity calculation
+    # ===============================
+    sims = []
+    for i in range(len(frames)-1):
+        f1, f2 = frames[i], frames[i+1]
+        if f1.sum() == 0 or f2.sum() == 0:
+            continue
+        f1, f2 = f1.astype(np.uint8), f2.astype(np.uint8)
+        dr = max(f1.max(), f2.max()) - min(f1.min(), f2.min())
+        if dr == 0:
+            sims.append(1.0)
+        else:
+            sims.append(ssim(f1, f2, data_range=dr))
+
+    return float(np.mean(sims)) if sims else 0.0
+
+# -------------------------------------------------------------------------
+# Compute complexity index
+# -------------------------------------------------------------------------
+def compute_complexity(mask, ignore_ids=None):
+    if ignore_ids is None:
+        ignore_ids = []
+
+    total_pixels = mask.size
+    if total_pixels == 0:
+        return 0.0
+
+    classes = np.unique(mask)
+    probs = []
+    for cid in classes:
+        if cid in ignore_ids:
+            continue
+        count = (mask == cid).sum()
+        if count > 0:
+            probs.append(count / total_pixels)
+
+    if not probs:
+        return 0.0
+
+    entropy = -sum([p * np.log(p) for p in probs])
+    return float(entropy)
+
+# -------------------------------------------------------------------------
+# PlacePulse-based evaluation (optional)
+# -------------------------------------------------------------------------
+class PlacePulseModel(nn.Module):
+    def __init__(self, num_classes=6):
+        super(PlacePulseModel, self).__init__()
+        self.base_model = models.resnet50(pretrained=False)
+        in_features = self.base_model.fc.in_features
+        self.base_model.fc = nn.Linear(in_features, num_classes)
+    def forward(self, x):
+        return self.base_model(x)
+
+# Load pretrained weights
+ENABLE_PLACEPULSE = False
+PP_WEIGHTS_PATH = model_dir / "PlacePulse.pth"
+
+placepulse_model = None
+if ENABLE_PLACEPULSE and PP_WEIGHTS_PATH.exists():
+    placepulse_model = PlacePulseModel(num_classes=6)
+    state_dict = torch.load(PP_WEIGHTS_PATH, map_location=device)
+    placepulse_model.load_state_dict(state_dict, strict=False)
+    placepulse_model = placepulse_model.to(device)
+    placepulse_model.eval()
+else:
+    print("[INFO] PlacePulse model disabled. "
+          "Set ENABLE_PLACEPULSE=True and provide model/PlacePulse.pth to enable.")
+
+# Preprocessing for PlacePulse
+pp_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Placepulse-based evaluation
+def evaluate_placepulse(img_rgb, model):
+    image = Image.fromarray(img_rgb)
+    image = pp_transform(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        outputs = model(image)
+        scores = torch.sigmoid(outputs).cpu().numpy()[0]
+    return scores
+
+# -------------------------------------------------------------------------
+# Prediction
+# -------------------------------------------------------------------------
+def predict_combined(facade_model_path, input_dir, output_dir, device, image_list):
+    # Load Facade model
+    model = FacadeResNet(n_classes=num_classes).to(device)
+    model.load_state_dict(torch.load(facade_model_path, map_location=device))
+    model.eval()
+
+    # Transform
+    inf_tf = A.Compose([
+        A.Resize(1024, 1024),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
+
+    # Collect images
+    rows = []
+    for rel_path in tqdm(image_list, desc="Prediction"):
+        img_path = os.path.join(input_dir, rel_path)
+        img_name = os.path.basename(img_path)
+        save_path = os.path.join(output_dir, f"{os.path.splitext(img_name)[0]}_combined.png")
+        orig_bgr = cv2.imread(img_path)
+        if orig_bgr is None:
+            print(f"[Warning] Failed to load image: {img_path}")
+            continue
+        orig = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+        H0, W0 = orig.shape[:2]
+
+        # ===============================
+        # Model prediction
+        # ===============================
+        # Facade model prediction
+        aug = inf_tf(image=orig)
+        x = aug["image"].unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = F.softmax(model(x), dim=1)[0].cpu().numpy()
+            pred_facade = logits.argmax(0).astype(np.uint8)
+        pred_facade = cv2.resize(pred_facade, (W0, H0), interpolation=cv2.INTER_NEAREST)
+
+        # COCO model prediction
+        input_tensor = tf.convert_to_tensor(orig, dtype=tf.uint8)
+        predictions = infer(input_tensor=input_tensor)
+        pred_map = predictions['semantic_pred'].numpy().astype(np.int32)[0]
+
+        # Combine model prediction
+        combined = pred_map.copy()
+        mask_facade = (pred_facade != 0) & (pred_facade != 9)
+        combined[mask_facade] = pred_facade[mask_facade]
+
+        colored_combined = np.zeros((H0, W0, 3), dtype=np.uint8)
+        mask_coco = (pred_facade == 0) | (pred_facade == 9)
+        colored_combined[mask_coco] = colorize_coco(combined)[mask_coco]
+        colored_combined[~mask_coco] = colorize(pred_facade)[~mask_coco]
+
+        # ===============================
+        # Visualization
+        # ===============================
+        # Subplots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+        axes[0,0].imshow(orig); axes[0,0].set_title("Original"); axes[0,0].axis("off")
+        axes[0,1].imshow(colorize_coco(pred_map)); axes[0,1].set_title("Benchmark"); axes[0,1].axis("off")
+        axes[1,0].imshow(colorize(pred_facade)); axes[1,0].set_title("Facade"); axes[1,0].axis("off")
+        axes[1,1].imshow(colored_combined); axes[1,1].set_title("Combined (Benchmark+Facade)"); axes[1,1].axis("off")
+
+        # Legend
+        patches = []
+        for class_id in np.unique(pred_map):
+            label = id2label.get(int(class_id), str(class_id))
+            color = np.array(coco_colormap[int(class_id)]) / 255
+            patches.append(mpatches.Patch(color=color, label=f"COCO_{label}"))
+
+        for fid, name in facade_classes.items():
+            if fid not in [0, 9]:
+                color = facade_colors[fid] / 255
+                patches.append(mpatches.Patch(color=color, label=f"Facade_{name}"))
+
+        plt.subplots_adjust(wspace=0.05, hspace=0.10)
+        fig.subplots_adjust(bottom=0.15)
+
+        fig.legend(
+            handles=patches,
+            loc='lower center',
+            bbox_to_anchor=(0.5, 0.0),
+            fontsize=8,
+            ncol=8,
+            frameon=False
+        )
+
+        plt.savefig(save_path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+        # ===============================
+        # Count pixels
+        # ===============================
+        total_pixels = H0 * W0
+        class_ratios = {"filename": img_name}
+
+        # COCO model classes
+        for class_id, name in id2label.items():
+            class_mask = (pred_map == int(class_id)) & (~mask_facade)
+            ratio = class_mask.sum() / total_pixels
+            class_ratios[f"COCO_{name}"] = ratio
+
+        # Facade model classes
+        for class_id, name in facade_classes.items():
+            if class_id not in [0, 9]:
+                class_mask = (pred_facade == class_id) & (mask_facade)
+                ratio = class_mask.sum() / total_pixels
+                class_ratios[f"Facade_{name}"] = ratio
+
+        # ===============================
+        # Transparency Index (TI)
+        # ===============================
+        A_building    = (pred_map == 110).sum() + (pred_map == 111).sum() + (pred_map == 112).sum() + (pred_map == 113).sum() + (pred_map == 130).sum() + (pred_map == 132).sum()
+
+        A_coco_window = (pred_map == 115).sum() + (pred_map == 116).sum()
+        A_coco_door   = (pred_map == 87).sum()
+        TI_coco = (A_coco_window + A_coco_door) / (A_coco_window + A_coco_door + A_building) if A_building > 0 else 0
+
+        A_facade_window = ((pred_facade == 6).sum() + (pred_facade == 7).sum() + (pred_facade == 8).sum())
+        A_facade_door = (pred_facade == 1).sum()
+        TI_combined = (A_facade_window + A_facade_door) / (A_facade_window + A_facade_door + A_building) if A_building > 0 else 0
+
+        class_ratios["TI_coco"] = TI_coco
+        class_ratios["TI_combined"] = TI_combined
+
+        # ===============================
+        # Harmony Index (HI)
+        # ===============================
+        HI_coco = compute_harmony(orig, pred_map, n_frames=5)
+        HI_combined = compute_harmony(orig, combined, n_frames=5)
+
+        class_ratios["HI_coco"] = HI_coco
+        class_ratios["HI_combined"] = HI_combined
+
+        # ===============================
+        # Complexity Index (CI)
+        # ===============================
+        CI_coco = compute_complexity(pred_map, ignore_ids=[0])
+        CI_combined = compute_complexity(combined, ignore_ids=[0])
+
+        class_ratios["CI_coco"] = CI_coco
+        class_ratios["CI_combined"] = CI_combined
+
+        # ===============================
+        # PlacePulse score (PP)
+        # ===============================
+        pp_dims = ["PP_beautiful", "PP_boring", "PP_depressing", "PP_lively", "PP_safe", "PP_wealthy"]
+        
+        if placepulse_model is not None:
+            pp_scores = evaluate_placepulse(orig, placepulse_model)
+            for dim_name, score in zip(pp_dims, pp_scores):
+                class_ratios[dim_name] = float(score)
+        else:
+            for dim_name in pp_dims:
+                class_ratios[dim_name] = np.nan
+
+        # ===============================
+        # Merging results
+        # ===============================
+        rows.append(class_ratios)
+
+    out_path = os.path.join(output_dir, "Prediction_Summary_all.xlsx")
+
+    df = pd.DataFrame(rows)
+    df.to_excel(out_path, index=False)
+    print(f"\nSaved results to: {out_path}.")
+
+# -------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        model_path = os.path.join(model_dir, "UrbanFacade.pth")
+        image_list = load_image_list(input_dir)
+        print(f"Processing {len(image_list)} images.")
+        predict_combined(model_path, input_dir, output_dir, device, image_list)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        input("\nAn error occurred. Press Enter to close...")
+    else:
+        input("\nDone. Press Enter to close...")
